@@ -260,6 +260,38 @@ struct {{name}}
         return dists;
     }
 
+    template <std::size_t rake>
+    static inline auto sdf_gradient(
+        const vamp::collision::Environment<FloatVector<rake>> &environment,
+        const ConfigurationBlock<rake> &x) noexcept
+        -> std::pair<std::array<FloatVector<rake>, {{n_spheres}}>, std::array<FloatVector<rake>, {{n_spheres}} * 3>>
+    {
+        std::array<FloatVector<rake, 1>, {{ccfk_code_vars}}> v;
+        std::array<FloatVector<rake, 1>, {{ccfk_code_output}}> y;
+        
+        {{ccfk_code}}
+
+        std::array<FloatVector<rake>, {{n_spheres}}> dists;
+        std::array<FloatVector<rake>, {{n_spheres}} * 3> grads;
+
+        {% for i in range(n_spheres) %}
+        {
+            auto res = vamp::sphere_environment_signed_distance_and_gradient(
+                environment,
+                y[{{ i * 4 + 0 }}],
+                y[{{ i * 4 + 1 }}],
+                y[{{ i * 4 + 2 }}],
+                y[{{ i * 4 + 3 }}]);
+            dists[{{i}}] = res.first;
+            grads[{{ 3 * i + 0 }}] = res.second[0];
+            grads[{{ 3 * i + 1 }}] = res.second[1];
+            grads[{{ 3 * i + 2 }}] = res.second[2];
+        }
+        {% endfor %}
+
+        return {dists, grads};
+    }
+
     static inline void d_collision_d_q(
         const std::array<float, {{n_q}}> &q_in,
         const std::array<float, {{n_spheres}} * 3> &gradients,
