@@ -234,6 +234,61 @@ struct {{name}}
 
         return to_isometry(y.data());
     }
+
+    template <std::size_t rake>
+    static inline auto sdf(
+        const vamp::collision::Environment<FloatVector<rake>> &environment,
+        const ConfigurationBlock<rake> &x) noexcept
+        -> std::array<FloatVector<rake>, {{n_spheres}}>
+    {
+        std::array<FloatVector<rake, 1>, {{ccfk_code_vars}}> v;
+        std::array<FloatVector<rake, 1>, {{ccfk_code_output}}> y;
+        
+        {{ccfk_code}}
+
+        std::array<FloatVector<rake>, {{n_spheres}}> dists;
+
+        {% for i in range(n_spheres) %}
+        dists[{{i}}] = vamp::sphere_environment_signed_distance(
+            environment,
+            y[{{ i * 4 + 0 }}],
+            y[{{ i * 4 + 1 }}],
+            y[{{ i * 4 + 2 }}],
+            y[{{ i * 4 + 3 }}]);
+        {% endfor %}
+
+        return dists;
+    }
+
+    static inline void d_collision_d_q(
+        const std::array<float, {{n_q}}> &q_in,
+        const std::array<float, {{n_spheres}} * 3> &gradients,
+        std::array<float, {{n_q}}> &out) noexcept
+    {
+        // Generated code expects a single input array 'x' containing
+        // [q_0, ..., q_n, gx_0, gy_0, gz_0, ..., gx_m, gy_m, gz_m]
+        std::array<float, {{n_q}} + {{n_spheres}} * 3> x;
+        
+        // Copy q
+        for(std::size_t i = 0; i < {{n_q}}; ++i) {
+            x[i] = q_in[i];
+        }
+        
+        // Copy gradients
+        for(std::size_t i = 0; i < {{n_spheres}} * 3; ++i) {
+            x[{{n_q}} + i] = gradients[i];
+        }
+
+        std::array<float, {{colgrad_code_vars}}> v;
+        std::array<float, {{colgrad_code_output}}> y;
+
+        {{colgrad_code}}
+
+        // Copy result to output
+        for(std::size_t i = 0; i < {{n_q}}; ++i) {
+            out[i] = y[i];
+        }
+    }
 };
 }
 

@@ -7,6 +7,7 @@
 #include <pinocchio/algorithm/kinematics.hpp>
 #include <pinocchio/algorithm/geometry.hpp>
 #include <pinocchio/multibody/geometry.hpp>
+#include <pinocchio/algorithm/jacobian.hpp>
 #include <pinocchio/collision/collision.hpp>
 
 #include <coal/shape/geometric_shapes.h>
@@ -27,6 +28,12 @@
 
 #include "lang_cpp.hh"
 #include "lang_rust.hh"
+
+#include <chrono>
+
+#include <cppad/cg/model/model_library_c_source_gen.hpp>
+#include <cppad/cg/model/compiler/gcc_compiler.hpp>
+#include <cppad/cg/model/dynamic_lib/linux/linux_dynamic_model_library_processor.hpp>
 
 using namespace pinocchio;
 using namespace CppAD;
@@ -546,6 +553,348 @@ auto trace_sphere_cc_fk(
     return Traced{function_code.str(), handler.getTemporaryVariableCount(), n_out};
 }
 
+auto trace_collision_gradient(
+    const RobotInfo &info,
+    const std::string &language,
+    bool spheres = true,
+    bool bounding_spheres = true) -> Traced
+{
+    auto nq = info.model.nq;
+    auto nv = info.model.nv;
+
+    ADModel ad_model = info.model.cast<ADCG>();
+    ADData ad_data(ad_model);
+
+    std::size_t n_spheres_count = 0;
+    if (spheres)
+    {
+        n_spheres_count += info.spheres.size();
+    }
+    if (bounding_spheres)
+    {
+        n_spheres_count += info.bounding_spheres.size();
+    }
+
+    // Input vector: [q (nq) | gradients (3 * n_spheres)]
+    std::size_t input_dim = nq + 3 * n_spheres_count;
+    ADVectorXs ad_x(input_dim);
+    for (auto i = 0U; i < input_dim; ++i)
+    {
+        ad_x[i] = ADCG(0.0);
+    }
+
+    Independent(ad_x);
+
+    // Extract q and gradients
+    ADVectorXs ad_q = ad_x.head(nq);
+
+    // Forward Kinematics & Jacobians
+    pinocchio::computeJointJacobians(ad_model, ad_data, ad_q);
+    pinocchio::framesForwardKinematics(ad_model, ad_data, ad_q);
+
+    // Prepare output gradient (generalized forces in tangent space)
+    ADVectorXs total_grad = ADVectorXs::Zero(nv);
+
+    // Using Data::Matrix6x for Jacobian storage
+    pinocchio::DataTpl<ADCG>::Matrix6x J_joint(6, nv);
+
+    std::size_t grad_idx = nq;  // Start reading gradients after q
+
+    auto process_sphere = [&](const SphereInfo &sphere) {
+        // 1. Read input gradient for this sphere
+        Eigen::Matrix<ADCG, 3, 1> sdf_grad;
+        sdf_grad[0] = ad_x[grad_idx++];
+        sdf_grad[1] = ad_x[grad_idx++];
+        sdf_grad[2] = ad_x[grad_idx++];
+
+        // 2. Compute Joint Jacobian (Local World Aligned)
+        // This gives us the spatial velocity of the Joint Origin, expressed in World Frame.
+        J_joint.setZero();
+        pinocchio::getJointJacobian(
+            ad_model, ad_data, sphere.parent_joint, pinocchio::LOCAL_WORLD_ALIGNED, J_joint);
+
+        // 3. Compute sphere offset in World Frame
+        // sphere.relative is in Joint Frame.
+        const auto &oMi = ad_data.oMi[sphere.parent_joint];
+        Eigen::Matrix<ADCG, 3, 1> offset_local;
+        offset_local[0] = sphere.relative.translation()[0];
+        offset_local[1] = sphere.relative.translation()[1];
+        offset_local[2] = sphere.relative.translation()[2];
+
+        Eigen::Matrix<ADCG, 3, 1> offset_world = oMi.rotation() * offset_local;
+
+        // 4. Transform Force to Joint Origin
+        // Force at sphere P: F = sdf_grad
+        // Equivalent Wrench at Joint Origin O:
+        //   Force F_o = F
+        //   Torque Tau_o = (P - O) x F = offset_world x sdf_grad
+        Eigen::Matrix<ADCG, 3, 1> torque_at_joint = offset_world.cross(sdf_grad);
+
+        // 5. Project to Generalized Coordinates
+        // tau_gen = J_joint^T * [F_o; Tau_o]
+        Eigen::Matrix<ADCG, 6, 1> spatial_force;
+        spatial_force.head(3) = sdf_grad;
+        spatial_force.tail(3) = torque_at_joint;
+
+        total_grad += J_joint.transpose() * spatial_force;
+    };
+
+    if (spheres)
+    {
+        for (const auto &sphere : info.spheres)
+        {
+            process_sphere(sphere);
+        }
+    }
+
+    if (bounding_spheres)
+    {
+        // Iterate in frame order to match trace_sphere_cc_fk
+        for (auto i = 0U; i < info.model.frames.size(); ++i)
+        {
+            auto it = info.bounding_spheres.find(i);
+            if (it != info.bounding_spheres.end())
+            {
+                process_sphere(it->second);
+            }
+        }
+    }
+
+    // Generate Code
+    ADFun<CGD> gradient_func(ad_x, total_grad);
+
+    CodeHandler<double> handler;
+    CppAD::vector<CGD> ind_vars(input_dim);
+    handler.makeVariables(ind_vars);
+
+    CppAD::vector<CGD> result = gradient_func.Forward(0, ind_vars);
+
+    LangCDefaultVariableNameGenerator<double> nameGen;
+    std::ostringstream function_code;
+
+    if (language == "c++")
+    {
+        LanguageCCustom<double> langC("double");
+        handler.generateCode(function_code, langC, result, nameGen);
+    }
+    else if (language == "rust")
+    {
+        LanguageRust<double> langRust("double");
+        handler.generateCode(function_code, langRust, result, nameGen);
+    }
+    else
+    {
+        throw std::runtime_error(fmt::format("unsupported language {}", language));
+    }
+
+    return Traced{function_code.str(), handler.getTemporaryVariableCount(), (std::size_t)nv};
+}
+
+auto verify_collision_gradient_correctness(const RobotInfo &info) -> void
+{
+    // 1. Setup CppAD Tape (same logic as trace_collision_gradient)
+    auto nq = info.model.nq;
+    auto nv = info.model.nv;
+
+    // We use CppAD::cg::CG<double> for code generation/tracing
+    using CGD = CppAD::cg::CG<double>;
+    using ADCG = CppAD::AD<CGD>;
+    using ADModel = pinocchio::ModelTpl<ADCG>;
+    using ADData = pinocchio::DataTpl<ADCG>;
+    using ADVectorXs = Eigen::Matrix<ADCG, Eigen::Dynamic, 1>;
+
+    ADModel ad_model = info.model.cast<ADCG>();
+    ADData ad_data(ad_model);
+
+    std::size_t n_spheres_count = info.spheres.size() + info.bounding_spheres.size();
+    std::size_t input_dim = nq + 3 * n_spheres_count;
+    
+    ADVectorXs ad_x(input_dim);
+    for (auto i = 0U; i < input_dim; ++i) ad_x[i] = ADCG(0.0);
+
+    CppAD::Independent(ad_x);
+
+    // --- Trace Logic Start ---
+    ADVectorXs ad_q = ad_x.head(nq);
+    pinocchio::computeJointJacobians(ad_model, ad_data, ad_q);
+    pinocchio::framesForwardKinematics(ad_model, ad_data, ad_q);
+    
+    ADVectorXs total_grad = ADVectorXs::Zero(nv);
+    pinocchio::DataTpl<ADCG>::Matrix6x J_joint(6, nv);
+    std::size_t grad_idx = nq;
+
+    auto process_sphere = [&](const SphereInfo &sphere) {
+        Eigen::Matrix<ADCG, 3, 1> sdf_grad;
+        sdf_grad[0] = ad_x[grad_idx++];
+        sdf_grad[1] = ad_x[grad_idx++];
+        sdf_grad[2] = ad_x[grad_idx++];
+
+        J_joint.setZero();
+        pinocchio::getJointJacobian(ad_model, ad_data, sphere.parent_joint, pinocchio::LOCAL_WORLD_ALIGNED, J_joint);
+
+        const auto &oMi = ad_data.oMi[sphere.parent_joint];
+        Eigen::Matrix<ADCG, 3, 1> offset_local;
+        offset_local[0] = sphere.relative.translation()[0];
+        offset_local[1] = sphere.relative.translation()[1];
+        offset_local[2] = sphere.relative.translation()[2];
+        Eigen::Matrix<ADCG, 3, 1> offset_world = oMi.rotation() * offset_local;
+        Eigen::Matrix<ADCG, 3, 1> torque_at_joint = offset_world.cross(sdf_grad);
+
+        Eigen::Matrix<ADCG, 6, 1> spatial_force;
+        spatial_force.head(3) = sdf_grad;
+        spatial_force.tail(3) = torque_at_joint;
+
+        total_grad += J_joint.transpose() * spatial_force;
+    };
+
+    for (const auto &sphere : info.spheres) process_sphere(sphere);
+    for (auto i = 0U; i < info.model.frames.size(); ++i) {
+        if (info.bounding_spheres.count(i)) process_sphere(info.bounding_spheres.at(i));
+    }
+    // --- Trace Logic End ---
+
+    CppAD::ADFun<CGD> fun(ad_x, total_grad);
+
+    // 2. Compile Library using CppADCodeGen
+    CppAD::cg::ModelCSourceGen<double> cgen(fun, "collision_gradient");
+    cgen.setCreateForwardZero(true);
+    cgen.setCreateJacobian(false);
+    cgen.setCreateSparseHessian(false);
+    
+    CppAD::cg::ModelLibraryCSourceGen<double> libcgen(cgen);
+    CppAD::cg::DynamicModelLibraryProcessor<double> p(libcgen);
+    
+    CppAD::cg::GccCompiler<double> compiler; 
+    compiler.addCompileFlag("-B/usr/lib/gcc/x86_64-linux-gnu/11/");
+    auto library = p.createDynamicLibrary(compiler);
+
+    const auto& model_lib= library->model("collision_gradient");
+
+    // 3. Ground Truth Verification Loop
+    pinocchio::Data data_gt(info.model);
+    Eigen::VectorXd q = Eigen::VectorXd::Zero(nq);
+    std::vector<double> input_vec(input_dim);
+    std::vector<double> output_vec(nv);
+    
+    int n_tests = 100;
+    double max_error = 0.0;
+    
+    // Random number generation
+    std::srand(std::time(nullptr));
+
+    fmt::print("\n--- Verifying Collision Gradient Consistency ---\n");
+
+    for(int k=0; k<n_tests; ++k) {
+        // Random q
+        q = pinocchio::randomConfiguration(info.model);
+        
+        // Fill input vector
+        for(size_t i=0; i<nq; ++i) input_vec[i] = q[i];
+
+        // Ground Truth Computation
+        pinocchio::computeJointJacobians(info.model, data_gt, q);
+        pinocchio::framesForwardKinematics(info.model, data_gt, q);
+        
+        Eigen::VectorXd gt_grad = Eigen::VectorXd::Zero(nv);
+        pinocchio::Data::Matrix6x J_temp(6, nv);
+
+        // Random Gradients & GT Accumulation
+        int grad_ptr = nq;
+        auto compute_gt_sphere = [&](const SphereInfo& s) {
+            Eigen::Vector3d g;
+            g.setRandom(); // Random gradient
+            
+            // Store in input for generated code
+            input_vec[grad_ptr++] = g[0];
+            input_vec[grad_ptr++] = g[1];
+            input_vec[grad_ptr++] = g[2];
+
+            // GT Logic
+            J_temp.setZero();
+            pinocchio::getJointJacobian(info.model, data_gt, s.parent_joint, pinocchio::LOCAL_WORLD_ALIGNED, J_temp);
+            
+            Eigen::Vector3d offset = data_gt.oMi[s.parent_joint].rotation() * s.relative.translation();
+            Eigen::Vector3d tau = offset.cross(g);
+            
+            pinocchio::Force f;
+            f.linear() = g;
+            f.angular() = tau;
+            
+            gt_grad += J_temp.transpose() * f.toVector();
+        };
+
+        for (const auto &s : info.spheres) compute_gt_sphere(s);
+        for (auto i = 0U; i < info.model.frames.size(); ++i) {
+            if (info.bounding_spheres.count(i)) compute_gt_sphere(info.bounding_spheres.at(i));
+        }
+
+        // Run Generated Code
+        output_vec = model_lib->ForwardZero(input_vec);
+
+        // Compare
+        for(int i=0; i<nv; ++i) {
+            double err = std::abs(output_vec[i] - gt_grad[i]);
+            if(err > max_error) max_error = err;
+        }
+    }
+
+    fmt::print("Verified {} tests. Max Error: {:.6e}\n", n_tests, max_error);
+    if(max_error > 1e-5) {
+        throw std::runtime_error("Verification FAILED: Gradient mismatch too large.");
+    } else {
+        fmt::print("Verification PASSED.\n");
+    }
+
+    // 4. Benchmarking
+    int n_bench = 10000;
+    fmt::print("\n--- Benchmarking ({} iterations) ---\n", n_bench);
+
+    // generated
+    auto start_gen = std::chrono::high_resolution_clock::now();
+    for(int k=0; k<n_bench; ++k) {
+         model_lib->ForwardZero(input_vec);
+    }
+    auto end_gen = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> diff_gen = end_gen - start_gen;
+    
+    // ground truth
+    // Note: re-using last q and gradients to avoid overhead of random generation
+    auto start_gt = std::chrono::high_resolution_clock::now();
+    for(int k=0; k<n_bench; ++k) {
+        pinocchio::computeJointJacobians(info.model, data_gt, q);
+        pinocchio::framesForwardKinematics(info.model, data_gt, q);
+        Eigen::VectorXd gt_grad = Eigen::VectorXd::Zero(nv);
+        // ... (simplified loop for speed, assuming same structure)
+         pinocchio::Data::Matrix6x J_temp(6, nv);
+         // Just do one representative sphere interaction to model the loop cost? 
+         // No, we must replicate the full loop for fair comparison.
+         // We'll iterate all spheres.
+         auto iter_spheres = [&](const SphereInfo& s) {
+             J_temp.setZero();
+             pinocchio::getJointJacobian(info.model, data_gt, s.parent_joint, pinocchio::LOCAL_WORLD_ALIGNED, J_temp);
+             // Dummy math to simulate cost
+             Eigen::Vector3d offset = data_gt.oMi[s.parent_joint].rotation() * s.relative.translation();
+             // We use pre-existing input_vec values
+             // (Accessing random indices to simulate read)
+             Eigen::Vector3d g(0.1, 0.2, 0.3); 
+             Eigen::Vector3d tau = offset.cross(g);
+             gt_grad += J_temp.transpose() * (Eigen::VectorXd(6) << g, tau).finished();
+         };
+         for (const auto &s : info.spheres) iter_spheres(s);
+         for (auto i = 0U; i < info.model.frames.size(); ++i) {
+            if (info.bounding_spheres.count(i)) iter_spheres(info.bounding_spheres.at(i));
+         }
+    }
+    auto end_gt = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> diff_gt = end_gt - start_gt;
+
+    fmt::print("Generated Code Time: {:.4f} s ({:.2f} us/iter)\n", 
+        diff_gen.count(), diff_gen.count() * 1e6 / n_bench);
+    fmt::print("Pinocchio (GT) Time: {:.4f} s ({:.2f} us/iter)\n", 
+        diff_gt.count(), diff_gt.count() * 1e6 / n_bench);
+    fmt::print("Speedup: {:.2f}x\n", diff_gt.count() / diff_gen.count());
+}
+
 int main(int argc, char **argv)
 {
     cxxopts::Options options(argv[0], "Tracing compiler for forward kinematics and collision checking");
@@ -558,6 +907,7 @@ int main(int argc, char **argv)
         ("t,output_template",
          "Output template filename (override configuration file)",
          cxxopts::value<std::string>())  //
+        ("v,verify", "Verify consistency against Pinocchio and benchmark")
         ("h,help", "Print usage")        //
         ;
 
@@ -620,7 +970,14 @@ int main(int argc, char **argv)
 
     RobotInfo robot(parent_path / data["urdf"], srdf_path, end_effector_name);
 
+    if (result.count("verify"))
+    {
+        verify_collision_gradient_correctness(robot);
+        return 0; // Exit after verification
+    }
+
     data.update(robot.json());
+
 
     auto traced_eefk_code = trace_sphere_cc_fk(robot, language, false, false, true);
     data["eefk_code"] = traced_eefk_code.code;
@@ -641,6 +998,12 @@ int main(int argc, char **argv)
     data["ccfkee_code"] = traced_ccfkee_code.code;
     data["ccfkee_code_vars"] = traced_ccfkee_code.temp_variables;
     data["ccfkee_code_output"] = traced_ccfkee_code.outputs;
+
+    auto traced_colgrad_code = trace_collision_gradient(robot, language, true, true);
+    data["colgrad_code"] = traced_colgrad_code.code;
+    data["colgrad_code_vars"] = traced_colgrad_code.temp_variables;
+    data["colgrad_code_output"] = traced_colgrad_code.outputs;
+
 
     inja::Environment env;
 
